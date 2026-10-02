@@ -532,3 +532,55 @@ func TestSSECustomMethod(t *testing.T) {
 		t.Errorf("Ping after custom method: %v", err)
 	}
 }
+
+// TestSSEClientTransport_OutlivesConnectContext checks that the event stream
+// is not tied to the context passed to Connect: a caller that bounds the
+// handshake with a timeout keeps a working session after that context ends.
+func TestSSEClientTransport_OutlivesConnectContext(t *testing.T) {
+	server := NewServer(testImpl, nil)
+	httpServer := httptest.NewServer(NewSSEHandler(func(*http.Request) *Server { return server }, nil))
+	defer httpServer.Close()
+
+	connectCtx, cancel := context.WithCancel(context.Background())
+	cs, err := NewClient(testImpl, nil).Connect(connectCtx, &SSEClientTransport{Endpoint: httpServer.URL}, nil)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer cs.Close()
+	cancel()
+
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	if err := cs.Ping(ctx, nil); err != nil {
+		t.Fatalf("Ping after the Connect context ended: %v", err)
+	}
+}
+
+// TestSSEClientTransport_ConnectHonorsContext checks that Connect still gives
+// up when its context ends before the server sends the endpoint event, and
+// that the GET is cancelled rather than left running.
+func TestSSEClientTransport_ConnectHonorsContext(t *testing.T) {
+	cancelled := make(chan struct{})
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+			close(cancelled)
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer httpServer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := (&SSEClientTransport{Endpoint: httpServer.URL}).Connect(ctx); err == nil {
+		t.Fatal("Connect succeeded without an endpoint event")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the GET was not cancelled when the Connect context ended")
+	}
+}

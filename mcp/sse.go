@@ -19,6 +19,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/internal/jsonrpc2"
 	"github.com/modelcontextprotocol/go-sdk/internal/util"
+	"github.com/modelcontextprotocol/go-sdk/internal/xcontext"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 )
 
@@ -426,7 +427,20 @@ func (c *SSEClientTransport) Connect(ctx context.Context) (Connection, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid endpoint: %v", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", c.Endpoint, nil)
+	// The GET carries the event stream for the life of the connection, so it
+	// must not end with ctx: callers commonly bound Connect with a timeout.
+	// As in StreamableClientTransport, detach it from ctx (keeping ctx's
+	// values) and cancel it only if ctx ends before the endpoint event
+	// arrives, or when the connection is closed.
+	connCtx, cancel := context.WithCancel(xcontext.Detach(ctx))
+	connected := false
+	defer func() {
+		if !connected {
+			cancel()
+		}
+	}()
+	stop := context.AfterFunc(ctx, cancel)
+	req, err := http.NewRequestWithContext(connCtx, "GET", c.Endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -473,6 +487,12 @@ func (c *SSEClientTransport) Connect(ctx context.Context) (Connection, error) {
 		resp.Body.Close()
 		return nil, fmt.Errorf("missing endpoint: %v", err)
 	}
+	if !stop() {
+		// ctx ended during the handshake and has already cancelled the GET.
+		resp.Body.Close()
+		return nil, ctx.Err()
+	}
+	connected = true
 
 	// From here on, the stream takes ownership of resp.Body.
 	s := &sseClientConn{
@@ -480,6 +500,7 @@ func (c *SSEClientTransport) Connect(ctx context.Context) (Connection, error) {
 		msgEndpoint: msgEndpoint,
 		incoming:    make(chan []byte, 100),
 		body:        resp.Body,
+		cancel:      cancel,
 		done:        make(chan struct{}),
 	}
 
@@ -513,6 +534,7 @@ type sseClientConn struct {
 
 	mu     sync.Mutex
 	body   io.ReadCloser // body of the hanging GET
+	cancel func()        // cancels the hanging GET
 	closed bool          // set when the stream is closed
 	done   chan struct{} // closed when the stream is closed
 }
@@ -577,6 +599,7 @@ func (c *sseClientConn) Close() error {
 	if !c.closed {
 		c.closed = true
 		_ = c.body.Close()
+		c.cancel()
 		close(c.done)
 	}
 	return nil
